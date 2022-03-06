@@ -18,15 +18,19 @@ package v2
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
 	tasktypes "github.com/containerd/containerd/api/types/task"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/identifiers"
@@ -37,7 +41,9 @@ import (
 	client "github.com/containerd/containerd/runtime/v2/shim"
 	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl"
 	ptypes "github.com/gogo/protobuf/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -269,6 +275,22 @@ func (s *shim) Create(ctx context.Context, opts runtime.CreateOpts) (runtime.Tas
 	if topts == nil {
 		topts = opts.RuntimeOptions
 	}
+
+	v, err := typeurl.UnmarshalAny(opts.Spec)
+	if err != nil {
+		fmt.Printf("unmarshalAny failed: %s", err)
+	}
+
+	lograte := "0"
+	if sp, ok := v.(*specs.Spec); ok {
+		for _, e := range sp.Process.Env {
+			s := strings.Split(e, "=")
+			if len(s) == 2 && s[0] == "NOMAD_META_NOMADGEN_LOGRATE" {
+				lograte = s[1]
+			}
+		}
+	}
+
 	request := &task.CreateTaskRequest{
 		ID:         s.ID(),
 		Bundle:     s.bundle.Path,
@@ -279,6 +301,35 @@ func (s *shim) Create(ctx context.Context, opts runtime.CreateOpts) (runtime.Tas
 		Checkpoint: opts.Checkpoint,
 		Options:    topts,
 	}
+
+	if !opts.IO.Terminal {
+		uri, _ := url.Parse("binary:///bin/shim-journald-limiter?lograte=" + lograte)
+		ioFn := cio.LogURI(uri)
+		i, err := ioFn(s.ID())
+		if err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			if err != nil && i != nil {
+				i.Cancel()
+				i.Close()
+			}
+		}()
+		cfg := i.Config()
+
+		request = &task.CreateTaskRequest{
+			ID:         s.ID(),
+			Bundle:     s.bundle.Path,
+			Stdin:      opts.IO.Stdin,
+			Stdout:     cfg.Stdout,
+			Stderr:     cfg.Stderr,
+			Terminal:   opts.IO.Terminal,
+			Checkpoint: opts.Checkpoint,
+			Options:    topts,
+		}
+	}
+
 	for _, m := range opts.Rootfs {
 		request.Rootfs = append(request.Rootfs, &types.Mount{
 			Type:    m.Type,
