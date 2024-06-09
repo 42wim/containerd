@@ -21,13 +21,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
 	tasktypes "github.com/containerd/containerd/api/types/task"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/identifiers"
 	"github.com/containerd/containerd/namespaces"
@@ -38,8 +41,10 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/hashicorp/go-multierror"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -215,9 +220,7 @@ func (s *shim) Close() error {
 }
 
 func (s *shim) delete(ctx context.Context) error {
-	var (
-		result *multierror.Error
-	)
+	var result *multierror.Error
 
 	if err := s.Close(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("failed to close ttrpc client: %w", err))
@@ -337,6 +340,47 @@ func (s *shimTask) Create(ctx context.Context, opts runtime.CreateOpts) (runtime
 		Checkpoint: opts.Checkpoint,
 		Options:    topts,
 	}
+
+	// sentinel to disable lograte if necessary
+	_, err := os.Stat("/var/run/containerd/normalflow")
+	_, err2 := os.Stat("/bin/shim-journald-limiter")
+	if err != nil && err2 == nil {
+		v, err := typeurl.UnmarshalAny(opts.Spec)
+		if err != nil {
+			fmt.Printf("unmarshalAny failed: %s", err)
+		}
+
+		lograte := ""
+		if sp, ok := v.(*specs.Spec); ok && sp != nil && sp.Process != nil {
+			for _, e := range sp.Process.Env {
+				s := strings.Split(e, "=")
+				if len(s) == 2 && s[0] == "NOMAD_META_NOMADGEN_LOGRATE" {
+					lograte = s[1]
+				}
+			}
+		}
+
+		if lograte != "" {
+			uri, _ := url.Parse("binary:///bin/shim-journald-limiter?lograte=" + lograte)
+			ioFn := cio.LogURI(uri)
+			i, err := ioFn(s.ID())
+			if err != nil {
+				return nil, err
+			}
+
+			defer func() {
+				if err != nil && i != nil {
+					i.Cancel()
+					i.Close()
+				}
+			}()
+			cfg := i.Config()
+
+			request.Stderr = cfg.Stderr
+			request.Stdout = cfg.Stdout
+		}
+	}
+
 	for _, m := range opts.Rootfs {
 		request.Rootfs = append(request.Rootfs, &types.Mount{
 			Type:    m.Type,
@@ -345,7 +389,7 @@ func (s *shimTask) Create(ctx context.Context, opts runtime.CreateOpts) (runtime
 		})
 	}
 
-	_, err := s.task.Create(ctx, request)
+	_, err = s.task.Create(ctx, request)
 	if err != nil {
 		return nil, errdefs.FromGRPC(err)
 	}
